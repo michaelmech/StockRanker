@@ -406,116 +406,27 @@ def engineer_relative_features(X,columns=[],n_neighbors=5):
   knn_X=create_stock_knn_features(rel_X,feature_cols=rel_X.columns,n_neighbors=n_neighbors)
   return knn_X
 
-import polars as pl
-import numpy as np
-import faiss                      # pip install faiss-cpu  (or faiss-gpu)
-from typing import Sequence, List, Dict
-
-import faiss
-
-def _build_faiss_index(dim: int, use_gpu: bool = False):
-    """
-    Returns an index that
-      • supports add / add_with_ids
-      • supports remove_ids
-      • can run on CPU **or** GPU
-    """
-    base = faiss.IndexFlatL2(dim)           # exact L2
-    id_map = faiss.IndexIDMap(base)         # <-- gives us add_with_ids / remove_ids
-
-    if use_gpu:
-        res     = faiss.StandardGpuResources()
-        id_map  = faiss.index_cpu_to_gpu(res, 0, id_map)   # GPU version keeps the ID-map layer
-
-    return id_map
-
-
-def _aggregate(values: np.ndarray, agg_funcs: Sequence[str]) -> Dict[str, float]:
-    out = {}
-    if 'mean'   in agg_funcs: out['mean']   = values.mean(axis=0)
-    if 'std'    in agg_funcs: out['std']    = values.std(axis=0, ddof=0)
-    if 'median' in agg_funcs: out['median'] = np.median(values, axis=0)
-    if 'max'    in agg_funcs: out['max']    = values.max(axis=0)
-    if 'min'    in agg_funcs: out['min']    = values.min(axis=0)
-    return out
+from typing import Sequence
+from featurengineer import FaissKNNFeatureEngineer
 
 @check_format
 def create_stock_knn_features(
-        df: pl.DataFrame,
+        df: pd.DataFrame,
         feature_cols: Sequence[str] = ('close',),
         n_neighbors: int = 5,
         lookback_window: int | None = None,
         agg_funcs: Sequence[str] = ('mean',),
         use_gpu: bool = False
-    ) -> pl.DataFrame:
-    """
-    Vectorised, FAISS-powered KNN feature builder.
-    * df must have columns: 'ticker', 'date' (string/ts), <feature_cols>
-    * Returns df with additional columns of the form
-        {f}_{agg}_{k}  (one per feature, agg function and k-th neighbor rank)
-    """
-
-    df = pl.from_pandas(df.reset_index() if isinstance(df.index, pd.MultiIndex) else df)
-    # ---- 0. Preparation ----------------------------------------------------
-    if not {'ticker', 'date', *feature_cols}.issubset(df.columns):
-        raise ValueError("df must contain 'ticker', 'date' and all feature_cols")
-
-    df = (df
-          .with_columns(pl.col('date').str.to_date())
-          .sort(['ticker', 'date'])
+    ) -> pd.DataFrame:
+    """Compatibility wrapper around FaissKNNFeatureEngineer."""
+    transformer = FaissKNNFeatureEngineer(
+        feature_cols=feature_cols,
+        n_neighbors=n_neighbors,
+        lookback_window=lookback_window,
+        agg_funcs=agg_funcs,
+        use_gpu=use_gpu,
     )
-
-    out_rows: List[Dict] = []
-    dim = len(feature_cols)
-
-    # ---- 1. Per-ticker processing (but done serially and fast) ------------
-    for ticker_df in df.partition_by('ticker', maintain_order=True):
-        values = ticker_df.select(feature_cols).to_numpy().astype('float32')
-        dates  = ticker_df['date'].to_numpy()
-        n      = len(values)
-
-        index  = _build_faiss_index(dim, use_gpu=use_gpu)
-
-        # sliding window boundaries
-        left = 0
-        for i in range(n):
-            # drop rows that moved out of lookback_window
-            if lookback_window is not None:
-                while left < i and i - left > lookback_window:
-                    index.remove_ids(np.array([left], dtype=np.int64))
-                    left += 1
-
-            # search k neighbours among past rows
-            if index.ntotal > 0:
-                _, idx = index.search(values[i:i+1], n_neighbors)
-                past_mask         = idx[0] < i          # ensure strictly historical
-                valid_idx         = idx[0][past_mask]
-                if valid_idx.size:
-                    neigh_values  = values[valid_idx]
-                    aggs = _aggregate(neigh_values, agg_funcs)
-                    out_rows.append(
-                        {
-                            "ticker": ticker_df[0, "ticker"],
-                            # NEW: store as ISO string → Polars sees utf8
-                            "date":   str(dates[i].astype("datetime64[D]")),
-                            **{f"{col}_{agg}_{n_neighbors}": v[j]
-                              for j, col in enumerate(feature_cols)
-                              for agg, v in aggs.items()}
-                        }
-                    )
-
-            # add current row to index
-            index.add_with_ids(values[i:i+1], np.array([i], dtype=np.int64))
-
-    feature_df = (
-    pl.DataFrame(out_rows)
-      .with_columns(
-          pl.col("date")
-            .str.strptime(pl.Date, "%Y-%m-%d")        # utf8 → Date
-      )
-    )
-
-    return df.join(feature_df, on=['ticker', 'date'], how='left').to_pandas()
+    return transformer.fit_transform(df)
 
 def fundamentals_multi(tickers,api_key=api_key):
   lst=[]
