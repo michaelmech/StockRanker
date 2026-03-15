@@ -436,3 +436,147 @@ class MetaLabeler:
                 final_preds.append(pred / cnt)
 
         return oof_pred, final_preds
+
+
+class MetaLabelingSimulationPipeline:
+    """End-to-end primary -> simulation -> meta-labeling -> simulation pipeline."""
+
+    def __init__(
+        self,
+        primary_model,
+        meta_model,
+        cv,
+        *,
+        top_n_longs: int,
+        top_n_shorts: int,
+        meta_threshold: float = 0.5,
+        simulation_kwargs: Optional[Dict[str, Any]] = None,
+        simulate_returns_fn: Optional[Callable[..., Any]] = None,
+    ):
+        self.primary_model = primary_model
+        self.meta_model = meta_model
+        self.cv = cv
+        self.top_n_longs = int(top_n_longs)
+        self.top_n_shorts = int(top_n_shorts)
+        self.meta_threshold = float(meta_threshold)
+        self.simulation_kwargs = simulation_kwargs or {}
+        self.simulate_returns_fn = simulate_returns_fn
+
+        if self.top_n_longs <= 0 or self.top_n_shorts <= 0:
+            raise ValueError("top_n_longs and top_n_shorts must both be > 0.")
+        if not 0.0 <= self.meta_threshold <= 1.0:
+            raise ValueError("meta_threshold must be between 0 and 1.")
+
+    @staticmethod
+    def _to_series(x, index: pd.Index, name: str) -> pd.Series:
+        if isinstance(x, pd.Series):
+            out = x
+        else:
+            out = pd.Series(x, index=index)
+        if not out.index.equals(index):
+            out = out.reindex(index)
+        if out.isna().any():
+            raise ValueError(f"{name} could not be aligned with X index.")
+        return out.astype(float)
+
+    @staticmethod
+    def _mi_to_wide(x: pd.Series, name: str) -> pd.DataFrame:
+        if not isinstance(x.index, pd.MultiIndex):
+            raise ValueError(f"{name} must use MultiIndex (ticker, date).")
+        tickers = x.index.get_level_values("ticker").astype(str)
+        dates = pd.to_datetime(x.index.get_level_values("date"))
+        x2 = x.copy()
+        x2.index = pd.MultiIndex.from_arrays([tickers, dates], names=["ticker", "date"])
+        wide = x2.unstack("ticker")
+        wide.index = pd.to_datetime(wide.index)
+        return wide.sort_index()
+
+    def _build_meta_labels(self, close: pd.Series, selections: Dict[str, pd.DataFrame]) -> pd.Series:
+        close_w = self._mi_to_wide(close, "close_prices")
+        fwd_ret = close_w.shift(-1) / close_w - 1.0
+
+        long_entries = selections["long_entries"].reindex(index=close_w.index, columns=close_w.columns).fillna(False)
+        short_entries = selections["short_entries"].reindex(index=close_w.index, columns=close_w.columns).fillna(False)
+
+        signed_ret = pd.DataFrame(np.nan, index=close_w.index, columns=close_w.columns, dtype=float)
+        signed_ret = signed_ret.where(~long_entries, fwd_ret)
+        signed_ret = signed_ret.where(~short_entries, -fwd_ret)
+
+        labels_w = (signed_ret > 0.0).astype(float)
+        active = long_entries | short_entries
+        labels_w = labels_w.where(active)
+
+        try:
+            labels = labels_w.stack(future_stack=True).dropna()
+        except TypeError:
+            labels = labels_w.stack(dropna=True)
+        labels.index = labels.index.set_names(["date", "ticker"])
+        labels = labels.reorder_levels(["ticker", "date"]).sort_index()
+        return labels.astype(int)
+
+    def _simulate(self, rank_df: pd.Series, close_prices: pd.Series):
+        simulate_fn = self.simulate_returns_fn
+        if simulate_fn is None:
+            from simulation import simulate_returns as simulate_fn
+
+        return simulate_fn(
+            rank_df=rank_df,
+            price_df=close_prices,
+            n_long=self.top_n_longs,
+            n_short=self.top_n_shorts,
+            **self.simulation_kwargs,
+        )
+
+    def run(self, X: pd.DataFrame, y_primary, close_prices) -> Dict[str, Any]:
+        if not isinstance(X, pd.DataFrame):
+            raise ValueError("X must be a pandas DataFrame.")
+
+        y_primary_s = y_primary if isinstance(y_primary, pd.Series) else pd.Series(y_primary, index=X.index)
+        close_s = self._to_series(close_prices, X.index, "close_prices")
+
+        primary_predictor = TimeRespectingOutOfSamplePredictor(
+            primary_model=self.primary_model,
+            cv=self.cv,
+        )
+        primary_oof, _ = primary_predictor.fit_predict(X, y_primary_s, prediction_sets=[])
+
+        valid_primary = primary_oof.notna()
+        primary_for_sim = primary_oof.fillna(0.0)
+        primary_pf, primary_sel = self._simulate(primary_for_sim, close_s)
+
+        meta_labels_sparse = self._build_meta_labels(close_s, primary_sel)
+        meta_labels = meta_labels_sparse.reindex(X.index).fillna(0).astype(int)
+
+        if meta_labels.nunique() < 2:
+            raise ValueError("Meta labels have a single class after simulation; cannot train meta model.")
+
+        meta_labeler = MetaLabeler(
+            meta_model=self.meta_model,
+            cv=self.cv,
+            primary_predictions=primary_oof.fillna(0.0),
+            profit_labels=meta_labels,
+        )
+        meta_oof, _ = meta_labeler.fit_predict(X, meta_labels, prediction_sets=[])
+
+        meta_score = meta_oof.fillna(0.0).clip(0.0, 1.0)
+        take_mask = meta_score >= self.meta_threshold
+        final_rank = primary_oof.fillna(0.0) * meta_score.where(take_mask, 0.0)
+        final_rank = final_rank.where(valid_primary, 0.0)
+
+        final_pf, final_sel = self._simulate(final_rank, close_s)
+
+        primary_stats = primary_pf.stats() if hasattr(primary_pf, "stats") else None
+        final_stats = final_pf.stats() if hasattr(final_pf, "stats") else None
+
+        return {
+            "primary_oof_predictions": primary_oof,
+            "primary_simulation": primary_pf,
+            "primary_selections": primary_sel,
+            "meta_labels": meta_labels,
+            "meta_oof_scores": meta_oof,
+            "final_rank": final_rank,
+            "final_simulation": final_pf,
+            "final_selections": final_sel,
+            "primary_stats": primary_stats,
+            "final_stats": final_stats,
+        }
