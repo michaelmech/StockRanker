@@ -15,7 +15,7 @@ from typing import List, Optional, Union, Callable, Any, Dict, Tuple
 
 import numpy as np
 import pandas as pd
-from flaml import AutoML
+from sklearn.base import clone
 
 '''
 # -------------------------
@@ -82,7 +82,7 @@ def _ensure_dir(d: Optional[Union[str, Path]]) -> Optional[Path]:
     p.mkdir(parents=True, exist_ok=True)
     return p
 
-def _save_automl_state(save_dir: Path, automl: AutoML, prefix: str = "flaml") -> None:
+def _save_automl_state(save_dir: Path, automl: Any, prefix: str = "flaml") -> None:
     pkl_path = save_dir / f"{prefix}_automl.pkl"
     meta_path = save_dir / f"{prefix}_best_meta.json"
 
@@ -98,7 +98,7 @@ def _save_automl_state(save_dir: Path, automl: AutoML, prefix: str = "flaml") ->
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2, default=str)
 
-def _load_automl_state(load_dir: Path, prefix: str = "flaml") -> Optional[AutoML]:
+def _load_automl_state(load_dir: Path, prefix: str = "flaml") -> Optional[Any]:
     pkl_path = load_dir / f"{prefix}_automl.pkl"
     if not pkl_path.exists():
         return None
@@ -130,7 +130,7 @@ def flaml_train_predict(
 
     # When cv is not None, build test predictions via fold models and return OOF
     return_oof: bool = True,
-) -> Tuple[np.ndarray, AutoML, Optional[np.ndarray]]:
+) -> Tuple[np.ndarray, Any, Optional[np.ndarray]]:
     """
     Returns:
         (test_predictions, automl, oof_predictions_or_None)
@@ -189,6 +189,8 @@ def flaml_train_predict(
         use_metric = metric  # string metric name, if you use any
 
     # ----- AutoML settings -----
+    from flaml import AutoML
+
     automl = AutoML()
     automl_settings = {
         "time_budget": time_budget,
@@ -306,3 +308,131 @@ def flaml_train_predict(
     # Otherwise: standard predict from full-data refit model
     test_pred = automl.predict(x_test)
     return np.asarray(test_pred), automl, None
+
+
+class TimeRespectingOutOfSamplePredictor:
+    """Generate out-of-sample predictions while respecting temporal ordering."""
+
+    def __init__(self, primary_model, cv):
+        self.primary_model = primary_model
+        self.cv = cv
+
+    @staticmethod
+    def _extract_dates(frame: pd.DataFrame) -> pd.Index:
+        if not isinstance(frame.index, pd.MultiIndex):
+            raise ValueError("Expected a MultiIndex with a date level.")
+        if "date" not in frame.index.names:
+            raise ValueError("Expected MultiIndex level named 'date'.")
+        return pd.to_datetime(frame.index.get_level_values("date"))
+
+    def fit_predict(self, X: pd.DataFrame, y, prediction_sets: List[pd.DataFrame]):
+        if not isinstance(X, pd.DataFrame):
+            raise ValueError("X must be a pandas DataFrame.")
+
+        y_series = y if isinstance(y, pd.Series) else pd.Series(y, index=X.index)
+        oof_pred = pd.Series(np.nan, index=X.index, dtype=float)
+        agg_preds = [pd.Series(0.0, index=pred.index, dtype=float) for pred in prediction_sets]
+        counts = [0 for _ in prediction_sets]
+
+        for train_idx, valid_idx in self.cv.split(X, y_series):
+            X_train = X.iloc[train_idx]
+            y_train = y_series.iloc[train_idx]
+            X_valid = X.iloc[valid_idx]
+
+            fitted = clone(self.primary_model)
+            fitted.fit(X_train, y_train)
+            oof_pred.iloc[valid_idx] = np.asarray(fitted.predict(X_valid)).ravel()
+
+            train_max_date = self._extract_dates(X_train).max()
+            for i, pred_set in enumerate(prediction_sets):
+                pred_dates = self._extract_dates(pred_set)
+                if pred_dates.min() <= train_max_date:
+                    continue
+                fold_pred = np.asarray(fitted.predict(pred_set)).ravel()
+                agg_preds[i] += pd.Series(fold_pred, index=pred_set.index)
+                counts[i] += 1
+
+        final_preds = []
+        for pred, cnt in zip(agg_preds, counts):
+            if cnt == 0:
+                final_preds.append(pd.Series(np.nan, index=pred.index, dtype=float))
+            else:
+                final_preds.append(pred / cnt)
+
+        return oof_pred, final_preds
+
+
+class MetaLabeler:
+    """Meta-label classifier that augments features with primary model predictions."""
+
+    def __init__(self, meta_model, cv, primary_predictions: pd.Series, profit_labels: pd.Series):
+        self.meta_model = meta_model
+        self.cv = cv
+        self.primary_predictions = primary_predictions
+        self.profit_labels = profit_labels
+
+    @staticmethod
+    def _predict_scores(model, X: pd.DataFrame) -> np.ndarray:
+        if hasattr(model, "predict_proba"):
+            proba = model.predict_proba(X)
+            if proba.ndim == 2 and proba.shape[1] > 1:
+                return proba[:, 1]
+        return np.asarray(model.predict(X)).ravel()
+
+    def _build_meta_features(self, X: pd.DataFrame, primary_preds: pd.Series) -> pd.DataFrame:
+        if not X.index.equals(primary_preds.index):
+            primary_preds = primary_preds.reindex(X.index)
+        if primary_preds.isna().any():
+            raise ValueError("Primary predictions contain missing values after alignment.")
+
+        X_meta = X.copy()
+        X_meta["primary_prediction"] = primary_preds.values
+        return X_meta
+
+    def fit_predict(self, X: pd.DataFrame, y_meta, prediction_sets: List[pd.DataFrame]):
+        y_meta_series = y_meta if isinstance(y_meta, pd.Series) else pd.Series(y_meta, index=X.index)
+        unique_labels = set(pd.Series(y_meta_series).dropna().unique())
+        if not unique_labels.issubset({0, 1}):
+            raise ValueError("y_meta must be binary and only contain values {0, 1}.")
+
+        if not X.index.equals(self.profit_labels.index):
+            aligned_profit = self.profit_labels.reindex(X.index)
+        else:
+            aligned_profit = self.profit_labels
+        if aligned_profit.isna().any():
+            raise ValueError("profit_labels must align with X and cannot contain NaNs.")
+
+        X_meta = self._build_meta_features(X, self.primary_predictions)
+        oof_pred = pd.Series(np.nan, index=X.index, dtype=float)
+        agg_preds = [pd.Series(0.0, index=pred.index, dtype=float) for pred in prediction_sets]
+        counts = [0 for _ in prediction_sets]
+
+        for train_idx, valid_idx in self.cv.split(X_meta, y_meta_series):
+            X_train = X_meta.iloc[train_idx]
+            y_train = y_meta_series.iloc[train_idx]
+            X_valid = X_meta.iloc[valid_idx]
+
+            fitted = clone(self.meta_model)
+            fitted.fit(X_train, y_train)
+            oof_pred.iloc[valid_idx] = self._predict_scores(fitted, X_valid)
+
+            train_dates = pd.to_datetime(X_train.index.get_level_values("date"))
+            train_max_date = train_dates.max()
+            for i, pred_set in enumerate(prediction_sets):
+                pred_primary = self.primary_predictions.reindex(pred_set.index)
+                X_pred_meta = self._build_meta_features(pred_set, pred_primary)
+                pred_dates = pd.to_datetime(X_pred_meta.index.get_level_values("date"))
+                if pred_dates.min() <= train_max_date:
+                    continue
+                fold_pred = self._predict_scores(fitted, X_pred_meta)
+                agg_preds[i] += pd.Series(fold_pred, index=X_pred_meta.index)
+                counts[i] += 1
+
+        final_preds = []
+        for pred, cnt in zip(agg_preds, counts):
+            if cnt == 0:
+                final_preds.append(pd.Series(np.nan, index=pred.index, dtype=float))
+            else:
+                final_preds.append(pred / cnt)
+
+        return oof_pred, final_preds
