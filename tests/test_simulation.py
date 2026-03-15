@@ -113,3 +113,58 @@ def test_calculate_smart_slippage_clips_and_handles_missing(monkeypatch):
     assert slippage.loc[idx[0], "BBB"] == pytest.approx(0.0102)
     assert slippage.loc[idx[1], "AAA"] == pytest.approx(0.0)
     assert slippage.loc[idx[1], "BBB"] == pytest.approx(0.02)
+
+
+def test_simulator_maps_predictions_to_entries_and_shifts_stops(monkeypatch, tiny_multiindex_df, capsys):
+    sim, calls = _load_simulation_with_stubs(monkeypatch)
+    df = tiny_multiindex_df
+
+    market_open = df["open"]
+    market_high = df["high"]
+    market_low = df["low"]
+    market_close = df["close"]
+    market_volume = df["volume"]
+
+    preds = pd.Series(0.0, index=df.index)
+    aaa_dates = sorted(df.loc[("AAA", slice(None)), :].index.get_level_values(1))
+    preds.loc[("AAA", aaa_dates[0])] = 1.0
+    preds.loc[("AAA", aaa_dates[1])] = 1.0
+    preds.loc[("AAA", aaa_dates[3])] = 1.0
+
+    simulator = sim.Simulator(
+        market_open,
+        market_high,
+        market_low,
+        market_close,
+        market_volume,
+        tp=0.02,
+        sl=0.01,
+        max_trade_size=0.25,
+        init_cash=100_000,
+        frequency="1d",
+        debug=True,
+    )
+
+    pf, diagnostics = simulator.run(preds)
+
+    assert pf == {"ok": True}
+    assert simulator.pf == {"ok": True}
+    assert isinstance(simulator.trades_df, pd.DataFrame)
+    assert simulator.trades_df.empty
+    assert diagnostics["prediction_active_count"] == 3
+    assert diagnostics["entry_count"] == 2
+    assert diagnostics["mapping_gap"] == 1
+
+    out = capsys.readouterr().out
+    assert "Simulator diagnostics:" in out
+
+    kwargs = calls["kwargs"]
+    assert kwargs["cash_sharing"] is True
+    assert kwargs["freq"] == "1d"
+
+    sl_stop = kwargs["sl_stop"]
+    tp_stop = kwargs["tp_stop"]
+    assert np.isinf(sl_stop.iloc[0]).all()
+    assert np.isinf(tp_stop.iloc[0]).all()
+    assert np.allclose(sl_stop.iloc[1:].to_numpy(), 0.01)
+    assert np.allclose(tp_stop.iloc[1:].to_numpy(), 0.02)
