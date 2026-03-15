@@ -75,3 +75,41 @@ def test_simulation_applies_adversarial_scaling_to_stops(monkeypatch, tiny_rank_
     assert np.isfinite(sl.to_numpy()).all() and np.isfinite(tp.to_numpy()).all()
     assert (sl.to_numpy() >= 0.1).all()
     assert (tp.to_numpy() >= 0.2).all()
+
+
+def test_calculate_smart_slippage_clips_and_handles_missing(monkeypatch):
+    sim, _ = _load_simulation_with_stubs(monkeypatch)
+
+    idx = pd.date_range("2024-01-01", periods=2, freq="D")
+    cols = ["AAA", "BBB"]
+
+    open_df = pd.DataFrame([[10.0, 20.0], [0.0, 40.0]], index=idx, columns=cols)
+    high_df = pd.DataFrame([[11.0, 21.0], [10.0, 44.0]], index=idx, columns=cols)
+    low_df = pd.DataFrame([[9.0, 19.0], [5.0, 36.0]], index=idx, columns=cols)
+    close_df = pd.DataFrame([[10.0, 20.0], [10.0, 40.0]], index=idx, columns=cols)
+    volume_df = pd.DataFrame([[1_000.0, 0.0], [2_000.0, 500.0]], index=idx, columns=cols)
+    size_frac = pd.DataFrame([[0.10, 0.20], [0.30, 0.40]], index=idx, columns=cols)
+
+    slippage = sim.calculate_smart_slippage(
+        open_df=open_df,
+        high_df=high_df,
+        low_df=low_df,
+        close_df=close_df,
+        volume_df=volume_df,
+        size_frac=size_frac,
+        init_cash=100_000.0,
+        base_spread=0.0002,
+        vol_mult=0.1,
+        impact_mult=0.1,
+        min_slippage=0.0005,
+        max_slippage=0.02,
+    )
+
+    assert slippage.shape == size_frac.shape
+    assert list(slippage.columns) == cols
+    assert (slippage.to_numpy() >= 0.0).all()
+    assert (slippage.to_numpy() <= 0.02).all()
+    assert slippage.loc[idx[0], "AAA"] == pytest.approx(0.02)
+    assert slippage.loc[idx[0], "BBB"] == pytest.approx(0.0102)
+    assert slippage.loc[idx[1], "AAA"] == pytest.approx(0.0)
+    assert slippage.loc[idx[1], "BBB"] == pytest.approx(0.02)
