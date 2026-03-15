@@ -18,6 +18,194 @@ import pandas as pd
 import vectorbt as vbt
 
 
+class Simulator:
+    """Long-only close-to-next-session simulator driven by prediction signals.
+
+    Predictions are expected as a pandas Series or 1-column DataFrame with
+    MultiIndex (ticker, date). Any value > 0 is treated as an active long signal.
+    Orders are submitted at the close of each signal bar. Stops become active from
+    the next bar onward by shifting stop percentages by one period.
+    """
+
+    def __init__(
+        self,
+        open_df: pd.Series | pd.DataFrame,
+        high_df: pd.Series | pd.DataFrame,
+        low_df: pd.Series | pd.DataFrame,
+        close_df: pd.Series | pd.DataFrame,
+        volumes_df: pd.Series | pd.DataFrame,
+        *,
+        tp: float = 0.02,
+        sl: float = 0.01,
+        horizon: int = 1,
+        max_trade_size: float = 0.10,
+        init_cash: float = 100_000.0,
+        weighting: str = "equal",
+        frequency: str = "1d",
+        debug: bool = False,
+    ):
+        self.tp = float(tp)
+        self.sl = float(sl)
+        self.horizon = int(horizon)
+        self.max_trade_size = float(max_trade_size)
+        self.init_cash = float(init_cash)
+        self.weighting = weighting
+        self.frequency = frequency
+        self.debug = bool(debug)
+
+        if self.horizon < 1:
+            raise ValueError("horizon must be >= 1")
+        if self.max_trade_size <= 0:
+            raise ValueError("max_trade_size must be > 0")
+        if self.weighting != "equal":
+            raise ValueError("Only weighting='equal' is currently supported.")
+
+        self.open_w = self._mi_to_wide(open_df, "open_df")
+        self.high_w = self._mi_to_wide(high_df, "high_df")
+        self.low_w = self._mi_to_wide(low_df, "low_df")
+        self.close_w = self._mi_to_wide(close_df, "close_df")
+        self.volume_w = self._mi_to_wide(volumes_df, "volumes_df")
+
+        self._align_market_data()
+        self.pf = None
+        self.trades_df = pd.DataFrame()
+
+    @staticmethod
+    def _mi_to_wide(x: pd.Series | pd.DataFrame, name: str) -> pd.DataFrame:
+        if isinstance(x, pd.DataFrame):
+            if x.shape[1] != 1:
+                raise ValueError(f"{name}: DataFrame must have exactly one column.")
+            x = x.iloc[:, 0]
+        if not isinstance(x, pd.Series) or not isinstance(x.index, pd.MultiIndex):
+            raise ValueError(f"{name}: must be a Series (or 1-col DF) with MultiIndex (ticker, date).")
+
+        tickers = x.index.get_level_values(0).astype(str)
+        dates = pd.to_datetime(x.index.get_level_values(1))
+        x2 = x.copy()
+        x2.index = pd.MultiIndex.from_arrays([tickers, dates], names=["ticker", "date"])
+        wide = x2.unstack("ticker")
+        wide.index = pd.to_datetime(wide.index)
+        return wide.sort_index().astype(float)
+
+    def _align_market_data(self):
+        common_idx = self.open_w.index
+        common_cols = self.open_w.columns
+        for df in [self.high_w, self.low_w, self.close_w, self.volume_w]:
+            common_idx = common_idx.intersection(df.index)
+            common_cols = common_cols.intersection(df.columns)
+
+        common_idx = common_idx.sort_values()
+        common_cols = common_cols.sort_values()
+
+        self.open_w = self.open_w.loc[common_idx, common_cols]
+        self.high_w = self.high_w.loc[common_idx, common_cols]
+        self.low_w = self.low_w.loc[common_idx, common_cols]
+        self.close_w = self.close_w.loc[common_idx, common_cols]
+        self.volume_w = self.volume_w.loc[common_idx, common_cols]
+
+
+
+    @staticmethod
+    def _extract_trades_df(portfolio) -> pd.DataFrame:
+        """Best-effort extraction of trade records from a vectorbt Portfolio."""
+        trades_obj = getattr(portfolio, "trades", None)
+        if trades_obj is None:
+            return pd.DataFrame()
+
+        records_readable = getattr(trades_obj, "records_readable", None)
+        if records_readable is not None:
+            if callable(records_readable):
+                try:
+                    out = records_readable()
+                except Exception:
+                    out = None
+            else:
+                out = records_readable
+            if isinstance(out, pd.DataFrame):
+                return out.copy()
+
+        records = getattr(trades_obj, "records", None)
+        if records is not None:
+            if callable(records):
+                try:
+                    out = records()
+                except Exception:
+                    out = None
+            else:
+                out = records
+            if isinstance(out, pd.DataFrame):
+                return out.copy()
+
+        return pd.DataFrame()
+
+    def run(self, predictions: pd.Series | pd.DataFrame):
+        pred_w = self._mi_to_wide(predictions, "predictions")
+        pred_w = pred_w.reindex(index=self.close_w.index, columns=self.close_w.columns)
+
+        valid_signal = pred_w.notna() & self.close_w.notna() & (self.close_w > 0)
+        raw_signal = (pred_w > 0) & valid_signal
+
+        if self.horizon > 1:
+            exits = raw_signal.shift(self.horizon, fill_value=False)
+            exits = exits & ~raw_signal
+        else:
+            exits = raw_signal.shift(1, fill_value=False) & ~raw_signal
+
+        entries = raw_signal & ~raw_signal.shift(1, fill_value=False)
+
+        active_counts = raw_signal.sum(axis=1).replace(0, np.nan)
+        per_name_weight = (self.max_trade_size / active_counts).clip(upper=self.max_trade_size)
+        size_frac = raw_signal.mul(per_name_weight, axis=0).fillna(0.0)
+        size_frac = size_frac.where(entries, 0.0)
+        size_value = size_frac * self.init_cash
+
+        slippage_matrix = calculate_smart_slippage(
+            open_df=self.open_w,
+            high_df=self.high_w,
+            low_df=self.low_w,
+            close_df=self.close_w,
+            volume_df=self.volume_w,
+            size_frac=size_frac,
+            init_cash=self.init_cash,
+        )
+
+        # Stops should not trigger on entry bar because entry is at close.
+        sl_matrix = pd.DataFrame(float(self.sl), index=self.close_w.index, columns=self.close_w.columns)
+        tp_matrix = pd.DataFrame(float(self.tp), index=self.close_w.index, columns=self.close_w.columns)
+        sl_matrix = sl_matrix.shift(1).fillna(np.inf)
+        tp_matrix = tp_matrix.shift(1).fillna(np.inf)
+
+        self.pf = vbt.Portfolio.from_signals(
+            open=self.open_w,
+            high=self.high_w,
+            low=self.low_w,
+            close=self.close_w,
+            entries=entries,
+            exits=exits,
+            size=size_value,
+            size_type="value",
+            init_cash=self.init_cash,
+            sl_stop=sl_matrix,
+            tp_stop=tp_matrix,
+            slippage=slippage_matrix,
+            cash_sharing=True,
+            freq=self.frequency,
+        )
+
+        self.trades_df = self._extract_trades_df(self.pf)
+
+        diagnostics = {
+            "prediction_active_count": int(raw_signal.to_numpy().sum()),
+            "entry_count": int(entries.to_numpy().sum()),
+            "exit_count": int(exits.to_numpy().sum()),
+        }
+        if self.debug:
+            diagnostics["mapping_gap"] = diagnostics["prediction_active_count"] - diagnostics["entry_count"]
+            print("Simulator diagnostics:", diagnostics)
+
+        return self.pf, diagnostics
+
+
 def calculate_smart_slippage(
     open_df: pd.DataFrame,
     high_df: pd.DataFrame,
