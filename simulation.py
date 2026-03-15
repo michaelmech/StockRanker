@@ -17,6 +17,37 @@ import numpy as np
 import pandas as pd
 import vectorbt as vbt
 
+
+def calculate_smart_slippage(
+    open_df: pd.DataFrame,
+    high_df: pd.DataFrame,
+    low_df: pd.DataFrame,
+    close_df: pd.DataFrame,
+    volume_df: pd.DataFrame,
+    size_frac: pd.DataFrame,
+    *,
+    init_cash: float = 100_000.0,
+    base_spread: float = 0.0002,
+    vol_mult: float = 0.1,
+    impact_mult: float = 0.1,
+    min_slippage: float = 0.0005,
+    max_slippage: float = 0.02,
+) -> pd.DataFrame:
+    """Estimate per-trade slippage with volatility + participation impact.
+
+    The output is a matrix with the same [date x ticker] shape as `size_frac`,
+    intended to be passed to vectorbt's `slippage` argument.
+    """
+    vol_comp = ((high_df - low_df) / open_df.replace(0.0, np.nan)) * float(vol_mult)
+
+    trade_dollar_val = size_frac * float(init_cash)
+    daily_dollar_volume = volume_df * close_df
+    participation_rate = (trade_dollar_val / daily_dollar_volume.replace(0.0, np.nan)).fillna(0.0)
+    impact_comp = float(impact_mult) * np.sqrt(participation_rate)
+
+    total_slippage = float(base_spread) + vol_comp + impact_comp
+    return total_slippage.clip(lower=float(min_slippage), upper=float(max_slippage)).fillna(0.0)
+
 def simulate_returns(
     rank_df: pd.Series | pd.DataFrame,
     price_df: pd.Series | pd.DataFrame,          # interpreted as CLOSE (backward compatible)
